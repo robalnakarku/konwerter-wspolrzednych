@@ -1,29 +1,29 @@
-import subprocess
-import sys
+# Copyright (C) 2026  m@rio
+# m@rio (OSM)   https://www.openstreetmap.org/user/m@rio
+# Claude (LLM)  https://claude.ai/
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# https://www.gnu.org/licenses/gpl-3.0.html
 
-def _install(pkg):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", pkg, "--quiet", "--disable-pip-version-check"])
-
-try:
-    from pyproj import Transformer
-except ImportError:
-    _install("pyproj")
-    from pyproj import Transformer
+import streamlit as st
+import re
+import io
+from pyproj import Transformer
 
 try:
     import mgrs as mgrs_lib
     MGRS_AVAILABLE = True
 except ImportError:
-    try:
-        _install("mgrs")
-        import mgrs as mgrs_lib
-        MGRS_AVAILABLE = True
-    except Exception:
-        MGRS_AVAILABLE = False
-
-import streamlit as st
-import re
-import io
+    MGRS_AVAILABLE = False
 
 # ── Page config ──────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -174,25 +174,50 @@ hr.divider {
 
 # ── Parsery ───────────────────────────────────────────────────────────────────
 
+def normalize_dms(s):
+    """Normalizuje warianty znaków stopni/minut/sekund do kanonicznych."""
+    s = re.sub(r'[º˚∘]', '°', s)   # º ˚ ∘ → °
+    s = re.sub(r'[ʹ′‘’]', "'", s) # ʹ ′ ' ' → '
+    s = re.sub(r'[ʺ″“”]', '"', s) # ʺ ″ " " → "
+    s = re.sub(r'  +', ' ', s)
+    return s
+
 def parse_dms(s):
-    """Parsuje DMS z literami przed lub po, z etykietami dł./szer./lon/lat."""
+    """Parsuje DMS — obsługuje º/°, spacje, etykiety dł./szer./lon/lat,
+    literę kierunkową przed lub po, dowolną kolejność lat/lon."""
+    s = normalize_dms(s)
     LON_LABELS = re.compile(r'dł[^°]*?:|lon(?:gitude)?\s*:', re.I)
     LAT_LABELS = re.compile(r'sz(?:er)?[^°]*?:|lat(?:itude)?\s*:', re.I)
 
-    # h_suf bez spacji (litera bezpośrednio po cudzysłowie lub minucie)
-    tok = re.compile(
-        r'([NSEWnsew])?\s*(\d{1,3})\s*°\s*(\d{1,2})\s*[\'′]\s*([\d.]+)(?:[\"″]([NSEWnsew])?|([NSEWnsew]))'
+    num_tok = re.compile(
+        r'([NSEWnsew])?\s*(\d{1,3})\s*°\s*(\d{1,2})\s*\'\s*([\d.]+)\s*"?'
     )
-    tokens = list(tok.finditer(s))
+    # Litery kierunkowe: standalone (nie część skrótu kończącego się :)
+    dir_chars = [
+        (m.start(), m.group().upper())
+        for m in re.finditer(r'(?<![A-Za-z:])[NSEWnsew](?![A-Za-z\d])', s)
+    ]
+
+    tokens = list(num_tok.finditer(s))
     if len(tokens) < 2:
         return None
 
     parsed = []
     for m in tokens:
-        h_pre, deg, mins, secs, h_suf1, h_suf2 = m.groups()
-        h = (h_pre or h_suf1 or h_suf2 or '').upper()
+        h_inline = (m.group(1) or '').upper()
+        deg, mins, secs = m.group(2), m.group(3), m.group(4)
+        tok_start, tok_end = m.start(), m.end()
+        h = h_inline
+        if not h:
+            for pos, ch in dir_chars:
+                if tok_start - 2 <= pos < tok_start:
+                    h = ch; break
+            if not h:
+                for pos, ch in dir_chars:
+                    if tok_end <= pos <= tok_end + 2:
+                        h = ch; break
         val = int(deg) + int(mins)/60 + float(secs)/3600
-        parsed.append({'val': val, 'h': h, 'pos': m.start()})
+        parsed.append({'val': val, 'h': h, 'pos': tok_start})
 
     def label_before(pos):
         prefix = s[:pos]
@@ -201,18 +226,15 @@ def parse_dms(s):
         return None
 
     t0, t1 = parsed[0], parsed[1]
-    l0 = label_before(t0['pos'])
-    l1 = label_before(t1['pos'])
+    l0, l1 = label_before(t0['pos']), label_before(t1['pos'])
 
     if   l0 == 'lon' and l1 == 'lat': lon_t, lat_t = t0, t1
     elif l0 == 'lat' and l1 == 'lon': lat_t, lon_t = t0, t1
     elif l0 == 'lon' or  l1 == 'lat': lon_t, lat_t = t0, t1
     elif l0 == 'lat' or  l1 == 'lon': lat_t, lon_t = t0, t1
     else:
-        h0_lat = t0['h'] in ('N','S')
-        h0_lon = t0['h'] in ('E','W')
-        h1_lat = t1['h'] in ('N','S')
-        h1_lon = t1['h'] in ('E','W')
+        h0_lat = t0['h'] in ('N','S'); h0_lon = t0['h'] in ('E','W')
+        h1_lat = t1['h'] in ('N','S'); h1_lon = t1['h'] in ('E','W')
         if   h0_lat and h1_lon: lat_t, lon_t = t0, t1
         elif h0_lon and h1_lat: lon_t, lat_t = t0, t1
         elif h0_lat:            lat_t, lon_t = t0, t1
@@ -223,7 +245,6 @@ def parse_dms(s):
 
     lat = lat_t['val'] * (-1 if lat_t['h'] == 'S' else 1)
     lon = lon_t['val'] * (-1 if lon_t['h'] == 'W' else 1)
-
     if -90 <= lat <= 90 and -180 <= lon <= 180:
         return lat, lon
     return None
@@ -454,7 +475,10 @@ def results_to_gpx(results):
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 
-st.markdown('<div class="main-title">🌐 Konwerter Współrzędnych</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="main-title" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">🌐 Konwerter Współrzędnych</div>',
+    unsafe_allow_html=True
+)
 st.markdown('<div class="subtitle">DMS · DDM · DD · UTM · MGRS  →  DD</div>', unsafe_allow_html=True)
 
 # Ustawienia
@@ -477,22 +501,15 @@ st.markdown('<hr class="divider">', unsafe_allow_html=True)
 tab1, tab2 = st.tabs(["📋  Wklej tekst", "📂  Wczytaj plik"])
 
 def show_results(results):
-    ok_count = sum(1 for r in results if r['ok'])
-    err_count = len(results) - ok_count
     only_ok = [r['wynik_dd'] for r in results if r['ok']]
+    ok_count = len(only_ok)
+    err_count = len(results) - ok_count
 
-    # ── Wyniki do skopiowania — natychmiast widoczne ──────────────────────────
+    # Wyniki DD — natychmiast do skopiowania
     if only_ok:
-        copy_text = "\n".join(only_ok)
-        label_html = (
-            '<div style="font-family:\'JetBrains Mono\',monospace;font-size:0.72rem;'
-            'color:#5a9fd4;letter-spacing:0.08em;text-transform:uppercase;'
-            'margin-bottom:4px;">Wyniki DD — zaznacz i skopiuj</div>'
-        )
-        st.markdown(label_html, unsafe_allow_html=True)
-        st.code(copy_text, language=None)
+        st.code("\n".join(only_ok), language=None)
 
-    # ── Statystyki ────────────────────────────────────────────────────────────
+    # Statystyki
     st.markdown(
         f'<div class="stat-box">Przetworzono: <span>{len(results)}</span> '
         f'&nbsp;·&nbsp; OK: <span>{ok_count}</span> '
@@ -500,10 +517,10 @@ def show_results(results):
         unsafe_allow_html=True
     )
 
-    # ── Szczegółowa tabela ────────────────────────────────────────────────────
+    # Szczegółowa tabela
     render_table(results)
 
-    # ── Pobierz GPX ───────────────────────────────────────────────────────────
+    # Pobierz GPX
     gpx_data = results_to_gpx(results)
     st.download_button(
         label="⬇ Pobierz GPX",
@@ -526,7 +543,7 @@ with tab1:
 
     text_input = st.text_area(
         "Wklej współrzędne (jedna linia = jeden punkt):",
-        height=110,
+        height=145,
         placeholder=example,
         label_visibility="visible",
     )
